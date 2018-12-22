@@ -18,6 +18,7 @@ package debug
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -34,22 +35,28 @@ import (
 	"github.com/dgraph-io/dgraph/types"
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/spf13/cobra"
+	"go.opencensus.io/stats"
+	"go.opencensus.io/stats/view"
 )
 
-var Debug x.SubCommand
-
-var opt flagOptions
+var (
+	Debug             x.SubCommand
+	opt               flagOptions
+	keySizeViewName   = "debug/key_size_histogram"
+	valueSizeViewName = "debug/value_size_histogram"
+)
 
 type flagOptions struct {
-	vals       bool
-	keyLookup  string
-	keyHistory bool
-	predicate  string
-	readOnly   bool
-	pdir       string
-	itemMeta   bool
-	jepsen     bool
-	jepsenAt   uint64
+	vals          bool
+	keyLookup     string
+	keyHistory    bool
+	predicate     string
+	readOnly      bool
+	pdir          string
+	itemMeta      bool
+	jepsen        bool
+	jepsenAt      uint64
+	sizeHistogram bool
 }
 
 func init() {
@@ -71,6 +78,7 @@ func init() {
 	flag.StringVarP(&opt.keyLookup, "lookup", "l", "", "Hex of key to lookup.")
 	flag.BoolVarP(&opt.keyHistory, "history", "y", false, "Show all versions of a key.")
 	flag.StringVarP(&opt.pdir, "postings", "p", "", "Directory where posting lists are stored.")
+	flag.BoolVar(&opt.sizeHistogram, "histogram", false, "Show a histogram of the key and value sizes.")
 }
 
 func toInt(o *pb.Posting) int {
@@ -482,6 +490,129 @@ func printKeys(db *badger.DB) {
 	fmt.Printf("Found %d keys\n", loop)
 }
 
+func getHistogramBounds(min_exponent, max_exponent uint32) []float64 {
+	var bounds []float64
+	for i := min_exponent; i <= max_exponent; i++ {
+		bounds = append(bounds, float64(int(1)<<i))
+	}
+	return bounds
+}
+
+type HistogramData struct {
+	Bounds          []float64
+	CountPerBucket  []int64
+	Mean            float64
+	SumOfSquaredDev float64
+}
+
+type HistogramExporter struct {
+	KeySizeHistogramData   HistogramData
+	ValueSizeHistogramData HistogramData
+}
+
+func (exporter HistogramExporter) ExportView(viewData *view.Data) {
+	switch data := viewData.Rows[0].Data.(type) {
+	case *view.DistributionData:
+		histogramData := HistogramData{}
+		histogramData.CountPerBucket = data.CountPerBucket
+		histogramData.Mean = data.Mean
+		histogramData.SumOfSquaredDev = data.SumOfSquaredDev
+
+		if viewData.View.Name == keySizeViewName {
+			exporter.KeySizeHistogramData = histogramData
+		} else {
+			exporter.ValueSizeHistogramData = histogramData
+		}
+	}
+}
+
+func (histogram HistogramData) PrintHistogram() {
+	fmt.Printf("Range\tCount\n")
+
+	num_bounds := len(histogram.Bounds)
+	for index, count := range histogram.CountPerBucket {
+		// The last bucket represents the bucket that contains the range from
+		// the last bound up to infinity so it's processed differently than the
+		// other buckets.
+		if index == len(histogram.CountPerBucket)-1 {
+			lower_bound := int(histogram.Bounds[num_bounds-1])
+			fmt.Printf("[%d, infinity]\t%d\n", lower_bound, count)
+			continue
+		}
+
+		upper_bound := int(histogram.Bounds[index])
+		lower_bound := 0
+		if index > 0 {
+			lower_bound = int(histogram.Bounds[index-1])
+		}
+
+		fmt.Printf("[%d, %d]\t%d\n", lower_bound, upper_bound, count)
+	}
+}
+
+func sizeHistogram(db *badger.DB) {
+	txn := db.NewTransactionAt(math.MaxUint64, false)
+	defer txn.Discard()
+
+	iopts := badger.DefaultIteratorOptions
+	iopts.PrefetchValues = false
+	itr := txn.NewIterator(iopts)
+	defer itr.Close()
+
+	keyBounds := getHistogramBounds(5, 16)
+	valueBounds := getHistogramBounds(5, 30)
+
+	keySizeMeasure := stats.Int64("debug/key_sizes",
+		"The size of the keys in bytes", "1")
+	keySizeView := &view.View{
+		Name:        valueSizeViewName,
+		Measure:     keySizeMeasure,
+		Description: "The distribution of the key sizes",
+		Aggregation: view.Distribution(keyBounds...),
+	}
+
+	valueSizeMeasure := stats.Int64("debug/value_sizes",
+		"The size of the values in bytes", "1")
+	valueSizeView := &view.View{
+		Name:        valueSizeViewName,
+		Measure:     valueSizeMeasure,
+		Description: "The distribution of the value sizes",
+		Aggregation: view.Distribution(valueBounds...),
+	}
+
+	exporter := HistogramExporter{}
+	exporter.KeySizeHistogramData.Bounds = keyBounds
+	exporter.ValueSizeHistogramData.Bounds = valueBounds
+
+	// Register the views and the exporter.
+	view.RegisterExporter(exporter)
+	if err := view.Register(keySizeView, valueSizeView); err != nil {
+		log.Fatalf("Failed to collect histogram information: %v", err)
+	}
+
+	var prefix []byte
+	if len(opt.predicate) > 0 {
+		prefix = x.PredicatePrefix(opt.predicate)
+	}
+
+	fmt.Printf("prefix = %s\n", hex.Dump(prefix))
+	var loop int
+	for itr.Seek(prefix); itr.ValidForPrefix(prefix); itr.Next() {
+		item := itr.Item()
+		keySize := int64(len(item.Key()))
+		valueSize := item.ValueSize()
+		stats.Record(context.TODO(), keySizeMeasure.M(keySize),
+			valueSizeMeasure.M(valueSize))
+		loop++
+	}
+
+	fmt.Printf("Found %d keys\n", loop)
+	fmt.Printf("Histogram of key sizes\n")
+	exporter.KeySizeHistogramData.PrintHistogram()
+	fmt.Printf("\nHistogram of value sizes\n")
+	exporter.ValueSizeHistogramData.PrintHistogram()
+}
+
 func run() {
 	bopts := badger.DefaultOptions
 	bopts.Dir = opt.pdir
@@ -501,6 +632,8 @@ func run() {
 		lookup(db)
 	case opt.jepsen:
 		jepsen(db)
+	case opt.sizeHistogram:
+		sizeHistogram(db)
 	default:
 		printKeys(db)
 	}
